@@ -1,0 +1,40 @@
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# .NET build output
+**/bin/
+**/obj/
+dist/
+publish/
+artifacts/
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# Logs, temp files and local archives
+*.log
+*.tmp
+*.temp
+*.bak
+*.zip
+*.7z
+*.rar
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+secrets.json
+appsettings.Local.json
