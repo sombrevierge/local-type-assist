@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$RepositoryName = "local-type-assist",
     [string]$Description = "Local-first text autocomplete for Windows with personal learning and Russian morphology"
 )
@@ -89,9 +89,9 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
-$remoteExists = git remote get-url origin 2>$null
-if ($LASTEXITCODE -eq 0 -and $remoteExists) {
-    Write-Host "Using existing remote: $remoteExists"
+$hasOrigin = (git remote) -contains "origin"
+if ($hasOrigin) {
+    Write-Host "Using existing origin remote."
     git push -u origin main
 } else {
     gh repo create $RepositoryName `
