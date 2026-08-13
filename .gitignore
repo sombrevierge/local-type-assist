@@ -38,3 +38,11 @@ Desktop.ini
 !.env.example
 secrets.json
 appsettings.Local.json
+
+# Python / local ML
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.sqlite3
+*.ml.json
