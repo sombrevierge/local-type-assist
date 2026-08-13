@@ -215,7 +215,6 @@ docs/                            architecture and behaviour documentation
 
 - [Architecture](docs/architecture.md)
 - [Behaviour test scenarios](docs/behavior-tests.md)
-- [Library crash diagnostics](docs/library-crash-diagnostics.md)
 - [Third-party notices](THIRD_PARTY_NOTICES.md)
 - [Word-list attribution](WORDLIST_ATTRIBUTION.md)
 - [Changelog](CHANGELOG.md)
