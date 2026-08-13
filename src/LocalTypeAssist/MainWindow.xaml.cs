@@ -62,7 +62,7 @@ public partial class MainWindow : Window
                 : trainingMode ? "Включить обучение" : "Включить подсказки";
 
             ProfileTextBox.Text = _host.Store.ProfileName;
-            ProfileHint.Text = $"Личная база: {_host.Store.LearnedWordCount:N0} • словарь: {_host.Store.SeedWordCount:N0} • контекстов: {_host.Store.LearnedContextCount:N0}";
+            ProfileHint.Text = $"Личная база: {_host.Store.LearnedWordCount:N0} • словарь: {_host.Store.SeedWordCount:N0} • контекстов: {_host.Store.LearnedContextCount:N0} • событий v7: {_host.Store.LearningEventCount:N0}";
             ProgressText.Text = $"{_host.Store.TotalObservations:N0} наблюдений";
 
             SelectComboValue(MinPrefixCombo, settings.MinPrefixLength.ToString());
@@ -75,6 +75,7 @@ public partial class MainWindow : Window
             LearnTypedCheckBox.IsChecked = settings.LearnTypedWords;
             MorphologyCheckBox.IsChecked = settings.MorphologyEnabled;
             SemanticCheckBox.IsChecked = settings.SemanticSuggestionsEnabled;
+            PersonalMlCheckBox.IsChecked = settings.PersonalMlEnabled;
             ShortWordsCheckBox.IsChecked = settings.AutoCompleteShortWords;
             ShiftCancelCheckBox.IsChecked = settings.ShiftCancelsCompletion;
             AutoStartCheckBox.IsChecked = settings.AutoStart;
@@ -104,6 +105,11 @@ public partial class MainWindow : Window
                 : _host.Morphology.IsReady
                     ? $"Морфология готова: {_host.Morphology.IndexedFormCount:N0} словоформ в локальном индексе."
                     : "Морфология загружается локально… Первичная индексация может занять несколько секунд.";
+
+            var mlStatus = _host.MlScorer.GetStatus();
+            MlStatusText.Text = mlStatus.Available
+                ? $"{mlStatus.Message} Последнее обучение: {mlStatus.TrainedAtUtc?.ToLocalTime():dd.MM HH:mm}."
+                : "ML пока не обучена. Откройте библиотеку после накопления исправлений и запустите локальное обучение.";
 
             Dispatcher.InvokeAsync(() =>
             {
@@ -174,6 +180,7 @@ public partial class MainWindow : Window
             completionMode == "Training" || LearnTypedCheckBox.IsChecked == true,
             MorphologyCheckBox.IsChecked == true,
             SemanticCheckBox.IsChecked == true,
+            PersonalMlCheckBox.IsChecked == true,
             ShortWordsCheckBox.IsChecked == true,
             ShiftCancelCheckBox.IsChecked == true,
             completionMode,
@@ -235,6 +242,12 @@ public partial class MainWindow : Window
         {
             FooterStatus.Text = "Ошибка импорта: " + exception.Message;
         }
+    }
+
+    private void OpenLearningLibrary_Click(object sender, RoutedEventArgs e)
+    {
+        _host.ShowLearningLibrary();
+        FooterStatus.Text = "Открыта библиотека обучения.";
     }
 
     private void OpenDataFolder_Click(object sender, RoutedEventArgs e)

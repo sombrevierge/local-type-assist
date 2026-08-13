@@ -38,6 +38,9 @@ public sealed class TypingController : IDisposable
     private int _selectedSuffixLength;
     private bool _selectedWasReplacement;
     private readonly HashSet<string> _rejectedSuggestionsForCurrentToken = new(StringComparer.OrdinalIgnoreCase);
+    private ProvisionalToken? _provisionalWord;
+    private string _editingOriginalWord = string.Empty;
+    private IReadOnlyList<string> _editingOriginalContext = Array.Empty<string>();
 
     public TypingController(
         AppSettings settings,
@@ -52,6 +55,7 @@ public sealed class TypingController : IDisposable
         _morphology = morphology;
         _window = window;
         _window.SuggestionClicked += suggestion => AcceptSuggestion(suggestion, selectInsertedSuffix: false);
+        _window.DismissRequested += DismissSuggestionsForCurrentWord;
         _autoCompleteTimer = new System.Threading.Timer(_ => OnAutoCompleteTimer(), null, Timeout.Infinite, Timeout.Infinite);
         _editorResyncTimer = new System.Threading.Timer(_ => OnEditorResyncTimer(), null, Timeout.Infinite, Timeout.Infinite);
     }
@@ -315,18 +319,23 @@ public sealed class TypingController : IDisposable
             }
         }
 
-        if (_window.HasSuggestions && key.VirtualKey == NativeMethods.VkEscape)
+        if (key.VirtualKey == NativeMethods.VkEscape &&
+            (_window.HasSuggestions || _currentWord.Length > 0 || _suppressSuggestionsForCurrentWord))
         {
-            _window.HideSuggestions();
-            _suppressSuggestionsForCurrentWord = true;
-            _autoCompletionSuppressedUntilBoundary = true;
-            return false;
+            DismissSuggestionsForCurrentWord();
+            return true;
         }
 
         if (key.VirtualKey == NativeMethods.VkBack)
         {
             if (_currentWord.Length > 0)
             {
+                if (_editingOriginalWord.Length == 0 && _currentWord.Length >= 2)
+                {
+                    _editingOriginalWord = _currentWord;
+                    _editingOriginalContext = _contextWords.ToArray();
+                }
+
                 if (_pendingAcceptance is not null &&
                     string.Equals(_currentWord, _pendingAcceptance.SuggestedWord, StringComparison.OrdinalIgnoreCase))
                 {
@@ -348,15 +357,27 @@ public sealed class TypingController : IDisposable
             }
             else
             {
-                // We can no longer know the previous word after Backspace crosses a word
-                // boundary. Drop stale context instead of ranking by text that was deleted.
-                _window.HideSuggestions();
-                _showingNextWordSuggestions = false;
-                _pendingAcceptance = null;
-                _currentSuggestions = Array.Empty<SuggestionItem>();
-                _contextWords.Clear();
-                _needsEditorResync = true;
-                ScheduleEditorResync();
+                if (_provisionalWord is not null)
+                {
+                    BeginEditingProvisionalWord();
+                    _window.HideSuggestions();
+                    _showingNextWordSuggestions = false;
+                    _currentSuggestions = Array.Empty<SuggestionItem>();
+                    _needsEditorResync = true;
+                    ScheduleEditorResync();
+                }
+                else
+                {
+                    // Backspace crossed a boundary we did not observe. Avoid carrying stale
+                    // context into the next ranking decision.
+                    _window.HideSuggestions();
+                    _showingNextWordSuggestions = false;
+                    _pendingAcceptance = null;
+                    _currentSuggestions = Array.Empty<SuggestionItem>();
+                    _contextWords.Clear();
+                    _needsEditorResync = true;
+                    ScheduleEditorResync();
+                }
             }
 
             return false;
@@ -391,6 +412,7 @@ public sealed class TypingController : IDisposable
 
     public void Reset()
     {
+        CommitProvisionalWord();
         _revision++;
         CancelIdleCompletion();
         _currentWord = string.Empty;
@@ -401,6 +423,8 @@ public sealed class TypingController : IDisposable
         _showingNextWordSuggestions = false;
         _autoCompletionSuppressedUntilBoundary = false;
         _needsEditorResync = false;
+        _editingOriginalWord = string.Empty;
+        _editingOriginalContext = Array.Empty<string>();
         ClearSelectedInsertion(keepSuggestion: true);
         ClearRejectedSuggestions();
         _editorResyncTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -697,26 +721,46 @@ public sealed class TypingController : IDisposable
     {
         if (_currentWord.Length >= 1)
         {
+            if (_editingOriginalWord.Length > 0 &&
+                !string.Equals(
+                    LocalLearningStore.NormalizeWord(_editingOriginalWord),
+                    LocalLearningStore.NormalizeWord(_currentWord),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _store.RecordCorrection(
+                    _editingOriginalWord,
+                    _currentWord,
+                    _editingOriginalContext,
+                    IsTrainingMode);
+                _pendingAcceptance = null;
+            }
+
+            _editingOriginalWord = string.Empty;
+            _editingOriginalContext = Array.Empty<string>();
+
+            // Keep the newest completed token provisional for one word. This prevents
+            // a typo from becoming positive training data when the user immediately
+            // backspaces over the delimiter and corrects it.
+            CommitProvisionalWord();
             var contextSnapshot = _contextWords.ToArray();
-            _store.RecordCompletedWord(
+            _provisionalWord = new ProvisionalToken(
                 _currentWord,
                 contextSnapshot,
                 _pendingAcceptance,
                 _settings.LearnTypedWords || IsTrainingMode,
                 IsTrainingMode);
 
-            if (_settings.LearnTypedWords || IsTrainingMode)
-            {
-                LearnGenderSignal(_currentWord, contextSnapshot);
-                // Make a newly learned word and its grammatical family available without
-                // waiting for an application restart or a profile switch.
-                _morphology.EnsureWordsIndexed(new[] { _currentWord });
-            }
             _contextWords.Enqueue(LocalLearningStore.NormalizeWord(_currentWord));
             while (_contextWords.Count > 5)
             {
                 _contextWords.Dequeue();
             }
+        }
+        else if (_editingOriginalWord.Length > 0)
+        {
+            _store.RecordDeletedWord(_editingOriginalWord, _editingOriginalContext);
+            _editingOriginalWord = string.Empty;
+            _editingOriginalContext = Array.Empty<string>();
         }
 
         _currentWord = string.Empty;
@@ -734,6 +778,80 @@ public sealed class TypingController : IDisposable
         {
             _contextWords.Clear();
         }
+    }
+
+    private void CommitProvisionalWord()
+    {
+        var token = _provisionalWord;
+        if (token is null)
+        {
+            return;
+        }
+
+        _provisionalWord = null;
+        _store.RecordCompletedWord(
+            token.Word,
+            token.ContextWords,
+            token.PendingAcceptance,
+            token.LearnTypedWords,
+            token.TrainingMode);
+
+        if (token.LearnTypedWords || token.TrainingMode)
+        {
+            LearnGenderSignal(token.Word, token.ContextWords);
+            _morphology.EnsureWordsIndexed(new[] { token.Word });
+        }
+    }
+
+    private void BeginEditingProvisionalWord()
+    {
+        var token = _provisionalWord;
+        if (token is null)
+        {
+            return;
+        }
+
+        _provisionalWord = null;
+        _currentWord = token.Word;
+        _pendingAcceptance = token.PendingAcceptance;
+        _editingOriginalWord = token.Word;
+        _editingOriginalContext = token.ContextWords;
+        PopLastContextWord(token.Word);
+        _suppressSuggestionsForCurrentWord = false;
+        _autoCompletionSuppressedUntilBoundary = true;
+        ClearRejectedSuggestions();
+    }
+
+    private void PopLastContextWord(string expectedWord)
+    {
+        if (_contextWords.Count == 0)
+        {
+            return;
+        }
+
+        var values = _contextWords.ToArray();
+        if (string.Equals(values[^1], LocalLearningStore.NormalizeWord(expectedWord), StringComparison.OrdinalIgnoreCase))
+        {
+            _contextWords.Clear();
+            foreach (var value in values[..^1])
+            {
+                _contextWords.Enqueue(value);
+            }
+        }
+    }
+
+    private void DismissSuggestionsForCurrentWord()
+    {
+        CancelIdleCompletion();
+        if (_currentWord.Length > 0)
+        {
+            _store.RecordDismissedPopup(_currentWord, _contextWords.ToArray());
+        }
+        _window.HideSuggestions();
+        _currentSuggestions = Array.Empty<SuggestionItem>();
+        _showingNextWordSuggestions = false;
+        _suppressSuggestionsForCurrentWord = true;
+        _autoCompletionSuppressedUntilBoundary = true;
     }
 
     private void LearnGenderSignal(string word, IReadOnlyList<string> context)
@@ -831,6 +949,7 @@ public sealed class TypingController : IDisposable
 
     private void ResetContextOnly()
     {
+        CommitProvisionalWord();
         _currentWord = string.Empty;
         _pendingAcceptance = null;
         _currentSuggestions = Array.Empty<SuggestionItem>();
@@ -839,6 +958,8 @@ public sealed class TypingController : IDisposable
         _showingNextWordSuggestions = false;
         _autoCompletionSuppressedUntilBoundary = false;
         _needsEditorResync = false;
+        _editingOriginalWord = string.Empty;
+        _editingOriginalContext = Array.Empty<string>();
         ClearRejectedSuggestions();
         _editorResyncTimer.Change(Timeout.Infinite, Timeout.Infinite);
         _window.HideSuggestions();
@@ -846,6 +967,7 @@ public sealed class TypingController : IDisposable
 
     private void SoftResetForFocusChange()
     {
+        CommitProvisionalWord();
         _revision++;
         CancelIdleCompletion();
         _currentWord = string.Empty;
@@ -853,6 +975,8 @@ public sealed class TypingController : IDisposable
         _currentSuggestions = Array.Empty<SuggestionItem>();
         _showingNextWordSuggestions = false;
         _suppressSuggestionsForCurrentWord = false;
+        _editingOriginalWord = string.Empty;
+        _editingOriginalContext = Array.Empty<string>();
         ClearSelectedInsertion(keepSuggestion: true);
         _window.HideSuggestions();
         _needsEditorResync = true;
@@ -960,8 +1084,17 @@ public sealed class TypingController : IDisposable
         NativeMethods.VkHome or NativeMethods.VkEnd or NativeMethods.VkPrior or NativeMethods.VkNext or
         NativeMethods.VkDelete or NativeMethods.VkEscape;
 
+    private sealed record ProvisionalToken(
+        string Word,
+        IReadOnlyList<string> ContextWords,
+        PendingAcceptance? PendingAcceptance,
+        bool LearnTypedWords,
+        bool TrainingMode);
+
     public void Dispose()
     {
+        CommitProvisionalWord();
+        _window.DismissRequested -= DismissSuggestionsForCurrentWord;
         _autoCompleteTimer.Dispose();
         _editorResyncTimer.Dispose();
         GC.SuppressFinalize(this);

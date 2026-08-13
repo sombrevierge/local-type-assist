@@ -18,6 +18,7 @@ public partial class SuggestionWindow : Window
     private string _prefix = string.Empty;
 
     public event Action<string>? SuggestionClicked;
+    public event Action? DismissRequested;
 
     public SuggestionWindow()
     {
@@ -270,8 +271,15 @@ public partial class SuggestionWindow : Window
         }
     }
 
+    private void Dismiss_Click(object sender, RoutedEventArgs e) => DismissRequested?.Invoke();
+
     private static string GetSourceLabel(SuggestionItem item)
     {
+        if (item.MlScore >= 0.35)
+        {
+            return "ПЕРСОНАЛЬНАЯ ML-МОДЕЛЬ";
+        }
+
         if (item.ContextCount > 0)
         {
             return "ПО КОНТЕКСТУ";

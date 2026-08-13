@@ -46,7 +46,8 @@ public sealed record SuggestionItem(
     int PrefixChoiceCount,
     bool MorphologyMatched,
     bool IsCorrection,
-    int EditDistance);
+    int EditDistance,
+    double MlScore = 0);
 
 public sealed record PendingAcceptance(
     string SuggestedWord,

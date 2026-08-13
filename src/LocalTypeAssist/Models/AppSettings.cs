@@ -4,7 +4,7 @@ namespace LocalTypeAssist.Models;
 
 public sealed class AppSettings
 {
-    public int SchemaVersion { get; set; } = 10;
+    public int SchemaVersion { get; set; } = 11;
     public bool Enabled { get; set; } = true;
     public int MinPrefixLength { get; set; } = 1;
     public int MaxSuggestions { get; set; } = 5;
@@ -12,6 +12,7 @@ public sealed class AppSettings
     public bool AutoStart { get; set; }
     public bool MorphologyEnabled { get; set; } = true;
     public bool SemanticSuggestionsEnabled { get; set; } = true;
+    public bool PersonalMlEnabled { get; set; } = true;
     public bool AutoCompleteShortWords { get; set; }
     public bool ShiftCancelsCompletion { get; set; } = true;
     public string CompletionMode { get; set; } = "Immediate";
@@ -26,6 +27,8 @@ public sealed class AppSettings
 
     public static string SettingsPath => Path.Combine(DataRoot, "settings.json");
     public static string ProfilesRoot => Path.Combine(DataRoot, "profiles");
+    public static string GetMlModelPath(string profileName) =>
+        Path.Combine(ProfilesRoot, LocalTypeAssist.Services.LocalLearningStore.SanitizeProfileName(profileName) + ".ml.json");
 
     public static AppSettings Load()
     {
@@ -64,6 +67,12 @@ public sealed class AppSettings
                 if (settings.SchemaVersion < 10)
                 {
                     settings.SchemaVersion = 10;
+                }
+
+                if (settings.SchemaVersion < 11)
+                {
+                    settings.SchemaVersion = 11;
+                    settings.PersonalMlEnabled = true;
                 }
 
                 settings.Normalize();

@@ -13,11 +13,13 @@ public sealed class AppHost : IDisposable
     private readonly LocalLearningStore _store;
     private readonly MorphologyService _morphology;
     private readonly SuggestionWindow _suggestionWindow;
+    private readonly PersonalMlScorer _mlScorer;
     private readonly SuggestionEngine _engine;
     private readonly TypingController _typingController;
     private readonly KeyboardHook _keyboardHook;
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly MainWindow _mainWindow;
+    private LearningLibraryWindow? _learningLibraryWindow;
     private bool _disposed;
     private bool _standaloneShiftCandidate;
 
@@ -28,14 +30,22 @@ public sealed class AppHost : IDisposable
         _store.SwitchProfile(_settings.ActiveProfile);
         _morphology = new MorphologyService();
         _suggestionWindow = new SuggestionWindow();
-        _engine = new SuggestionEngine(_store, _morphology, _settings);
+        _mlScorer = new PersonalMlScorer(_store.ProfileName);
+        _engine = new SuggestionEngine(_store, _morphology, _settings, _mlScorer);
         _typingController = new TypingController(_settings, _store, _engine, _morphology, _suggestionWindow);
         _keyboardHook = new KeyboardHook();
         _keyboardHook.KeyDown += HandleGlobalKey;
         _keyboardHook.KeyUp += HandleGlobalKeyUp;
 
         _mainWindow = new MainWindow(this);
-        _store.Changed += (_, _) => Application.Current.Dispatcher.InvokeAsync(_mainWindow.RefreshState);
+        _store.Changed += (_, _) => Application.Current.Dispatcher.InvokeAsync(() =>
+        {
+            _mainWindow.RefreshState();
+            if (_learningLibraryWindow?.IsVisible == true)
+            {
+                _learningLibraryWindow.RequestRefresh();
+            }
+        });
         _morphology.StateChanged += (_, _) =>
         {
             // Words learned while the initial morphology index is still loading must
@@ -55,6 +65,7 @@ public sealed class AppHost : IDisposable
     public AppSettings Settings => _settings;
     public LocalLearningStore Store => _store;
     public MorphologyService Morphology => _morphology;
+    public PersonalMlScorer MlScorer => _mlScorer;
 
     public void Start(bool background)
     {
@@ -109,6 +120,7 @@ public sealed class AppHost : IDisposable
         bool learnTypedWords,
         bool morphologyEnabled,
         bool semanticSuggestionsEnabled,
+        bool personalMlEnabled,
         bool autoCompleteShortWords,
         bool shiftCancelsCompletion,
         string completionMode,
@@ -121,6 +133,7 @@ public sealed class AppHost : IDisposable
         _settings.LearnTypedWords = learnTypedWords;
         _settings.MorphologyEnabled = morphologyEnabled;
         _settings.SemanticSuggestionsEnabled = semanticSuggestionsEnabled;
+        _settings.PersonalMlEnabled = personalMlEnabled;
         _settings.AutoCompleteShortWords = autoCompleteShortWords;
         _settings.ShiftCancelsCompletion = shiftCancelsCompletion;
         _settings.CompletionMode = completionMode;
@@ -145,9 +158,11 @@ public sealed class AppHost : IDisposable
         var safeName = LocalLearningStore.SanitizeProfileName(profileName);
         _typingController.Reset();
         _store.SwitchProfile(safeName);
+        _mlScorer.SwitchProfile(safeName);
         _settings.ActiveProfile = safeName;
         _settings.Save();
         _morphology.EnsureWordsIndexed(_store.GetKnownWordsSnapshot());
+        _learningLibraryWindow?.RequestRefresh();
         RefreshUi();
     }
 
@@ -163,6 +178,78 @@ public sealed class AppHost : IDisposable
     {
         _typingController.Reset();
         _store.ResetActiveProfile();
+        _mlScorer.Reload();
+        _learningLibraryWindow?.RequestRefresh();
+        RefreshUi();
+    }
+
+    public void ShowLearningLibrary()
+    {
+        try
+        {
+            if (_learningLibraryWindow is null)
+            {
+                _learningLibraryWindow = new LearningLibraryWindow(this, _mainWindow.IsVisible ? _mainWindow : null);
+                _learningLibraryWindow.Closed += (_, _) => _learningLibraryWindow = null;
+            }
+
+            if (!_learningLibraryWindow.IsVisible)
+            {
+                _learningLibraryWindow.Show();
+            }
+
+            _learningLibraryWindow.Activate();
+            _learningLibraryWindow.RefreshData();
+        }
+        catch (Exception exception)
+        {
+            AppLog.Error("Opening learning library failed.", exception);
+            try
+            {
+                _learningLibraryWindow?.Close();
+            }
+            catch
+            {
+                // Ignore secondary cleanup failures.
+            }
+
+            _learningLibraryWindow = null;
+            MessageBox.Show(
+                $"Не удалось открыть библиотеку обучения.\n\n{exception.Message}\n\nЛог: {AppLog.LogPath}",
+                "Local Type Assist",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
+    }
+
+    public async Task<string> TrainPersonalModelAsync()
+    {
+        _store.SaveNow();
+        var result = await MlTrainingService.TrainAsync(_store.ProfileName);
+        _mlScorer.Reload();
+        RefreshUi();
+        return result;
+    }
+
+    public void ReloadPersonalModel(bool invalidate = false)
+    {
+        if (invalidate)
+        {
+            var path = AppSettings.GetMlModelPath(_store.ProfileName);
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // A stale optional ML file is less important than keeping the UI responsive.
+            }
+        }
+
+        _mlScorer.Reload();
         RefreshUi();
     }
 
@@ -281,6 +368,7 @@ public sealed class AppHost : IDisposable
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("Открыть", null, (_, _) => Application.Current.Dispatcher.InvokeAsync(ShowMainWindow));
         menu.Items.Add("Включить / пауза", null, (_, _) => Application.Current.Dispatcher.InvokeAsync(ToggleEnabled));
+        menu.Items.Add("Библиотека обучения", null, (_, _) => Application.Current.Dispatcher.InvokeAsync(ShowLearningLibrary));
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("Выход", null, (_, _) => Application.Current.Dispatcher.InvokeAsync(ExitApplication));
         tray.ContextMenuStrip = menu;
@@ -308,6 +396,7 @@ public sealed class AppHost : IDisposable
         _disposed = true;
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
+        try { _learningLibraryWindow?.Close(); } catch { }
         _suggestionWindow.HideSuggestions();
         _typingController.Dispose();
         _keyboardHook.Dispose();

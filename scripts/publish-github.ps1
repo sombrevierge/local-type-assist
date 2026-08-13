@@ -77,7 +77,7 @@ $staged = git diff --cached --name-only
 if (-not $staged) {
     Write-Host "There are no new files to commit."
 } else {
-    git commit -m "Initial public release"
+    git commit -m "Update Local Type Assist"
 }
 
 gh auth status *> $null

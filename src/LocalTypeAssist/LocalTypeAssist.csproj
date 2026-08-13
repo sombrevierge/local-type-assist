@@ -13,13 +13,21 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <DebugType>embedded</DebugType>
-    <Version>6.8.0</Version>
-    <FileVersion>6.8.0.0</FileVersion>
+    <Version>7.0.4</Version>
+    <FileVersion>7.0.4.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="Resources\seed_words.txt" />
     <EmbeddedResource Include="Resources\seed_phrases.tsv" />
     <PackageReference Include="Nestor" Version="0.5.2" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
+    <Content Include="Resources\ml\train_personal_model.py">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Resources\ml\requirements-ml.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 </Project>

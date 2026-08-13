@@ -12,6 +12,8 @@ public sealed class LocalLearningStore : IDisposable
     private readonly Dictionary<string, int> _seedTrigrams = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _seedFourgrams = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Threading.Timer _saveTimer;
+    private readonly LearningEventStore _eventStore;
+    private Dictionary<string, LearningWordSignals> _wordSignals = new(StringComparer.OrdinalIgnoreCase);
     private ProfileData _data = new();
     private string _profileName = "default";
     private bool _dirty;
@@ -28,6 +30,7 @@ public sealed class LocalLearningStore : IDisposable
     {
         LoadSeedWords();
         LoadSeedPhrases();
+        _eventStore = new LearningEventStore();
         _saveTimer = new System.Threading.Timer(_ => SaveNow(), null, Timeout.Infinite, Timeout.Infinite);
     }
 
@@ -76,6 +79,8 @@ public sealed class LocalLearningStore : IDisposable
         }
     }
 
+    public int LearningEventCount => _eventStore.GetEventCount();
+
     public int TotalObservations
     {
         get
@@ -99,6 +104,8 @@ public sealed class LocalLearningStore : IDisposable
             _dirty = false;
         }
 
+        _eventStore.SwitchProfile(safeName);
+        RefreshSignalsFromEvents();
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -131,14 +138,21 @@ public sealed class LocalLearningStore : IDisposable
             return _data.Words.Keys
                 .Concat(_seedRanks.Keys)
                 .Where(word => word.Length > normalized.Length && word.StartsWith(normalized, StringComparison.OrdinalIgnoreCase))
+                .Where(word => !_wordSignals.TryGetValue(word, out var signals) || !signals.Blocked)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderByDescending(word =>
                 {
                     var stat = _data.Words.TryGetValue(word, out var value) ? value : null;
+                    var signals = _wordSignals.TryGetValue(word, out var learnedSignals) ? learnedSignals : null;
                     return (stat?.TrainingCount ?? 0) * 30 +
                            (stat?.AcceptedCount ?? 0) * 12 +
                            (stat?.CorpusCount ?? 0) * 3 +
-                           (stat?.TypedCount ?? 0);
+                           (stat?.TypedCount ?? 0) +
+                           (signals?.ConfirmedCount ?? 0) * 5 +
+                           (signals?.CorrectionTargetCount ?? 0) * 12 +
+                           (signals?.Trusted == true ? 250 : 0) -
+                           (signals?.CorrectedAwayCount ?? 0) * 20 -
+                           (signals?.DeletedCount ?? 0) * 6;
                 })
                 .ThenBy(word => _seedRanks.TryGetValue(word, out var rank) ? rank : int.MaxValue)
                 .ThenBy(word => word.Length)
@@ -333,7 +347,17 @@ public sealed class LocalLearningStore : IDisposable
             }
         }
 
+        HashSet<string> blockedWords;
+        lock (_gate)
+        {
+            blockedWords = _wordSignals
+                .Where(pair => pair.Value.Blocked)
+                .Select(pair => pair.Key)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+
         return scores
+            .Where(x => !blockedWords.Contains(x.Key))
             .OrderByDescending(x => x.Value)
             .ThenByDescending(x => GetWordStat(x.Key).TrainingCount)
             .ThenBy(x => GetSeedRank(x.Key))
@@ -424,9 +448,17 @@ public sealed class LocalLearningStore : IDisposable
             _data.RejectedChoices[key] = _data.RejectedChoices.TryGetValue(key, out var count)
                 ? Math.Min(count + 1, 100)
                 : 1;
+            var signals = GetOrCreateSignalsLocked(word);
+            signals.RejectedSuggestionCount++;
             MarkDirtyLocked();
         }
 
+        _eventStore.RecordEvent(
+            LearningEventType.RejectedSuggestion,
+            word,
+            contextWords,
+            prefix: prefix,
+            suggestion: word);
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -487,15 +519,18 @@ public sealed class LocalLearningStore : IDisposable
             {
                 var suggested = NormalizeWord(pendingAcceptance.SuggestedWord);
                 var suggestionStat = GetOrCreateWordLocked(suggested);
-                if (string.Equals(actual, suggested, StringComparison.OrdinalIgnoreCase))
+                var acceptedExactly = string.Equals(actual, suggested, StringComparison.OrdinalIgnoreCase);
+                var acceptedThenExtended = !acceptedExactly &&
+                                           actual.StartsWith(suggested, StringComparison.OrdinalIgnoreCase);
+                if (acceptedExactly || acceptedThenExtended)
                 {
                     suggestionStat.AcceptedCount++;
                     suggestionStat.LastUsedUtc = DateTime.UtcNow;
                     var prefixKey = PrefixChoiceKey(pendingAcceptance.Prefix, suggested);
                     _data.PrefixChoices[prefixKey] = _data.PrefixChoices.TryGetValue(prefixKey, out var count)
-                        ? count + 3
-                        : 3;
-                    LearnContextPrefixChoicesLocked(suggested, pendingAcceptance.ContextWords, 3);
+                        ? count + (acceptedExactly ? 3 : 1)
+                        : (acceptedExactly ? 3 : 1);
+                    LearnContextPrefixChoicesLocked(suggested, pendingAcceptance.ContextWords, acceptedExactly ? 3 : 1);
 
                     var rejectedKey = RejectedChoiceKey(
                         pendingAcceptance.Prefix,
@@ -556,7 +591,245 @@ public sealed class LocalLearningStore : IDisposable
             MarkDirtyLocked();
         }
 
+        if (shouldLearnTyped || pendingAcceptance is not null)
+        {
+            var suggestedWord = pendingAcceptance is null
+                ? string.Empty
+                : NormalizeWord(pendingAcceptance.SuggestedWord);
+            var acceptedSuggestion = pendingAcceptance is not null &&
+                                     string.Equals(actual, suggestedWord, StringComparison.OrdinalIgnoreCase);
+            var acceptedThenExtended = pendingAcceptance is not null &&
+                                       !acceptedSuggestion &&
+                                       actual.StartsWith(suggestedWord, StringComparison.OrdinalIgnoreCase);
+            var eventType = trainingMode
+                ? LearningEventType.TrainingObservation
+                : acceptedSuggestion
+                    ? LearningEventType.AcceptedSuggestion
+                    : LearningEventType.TypedClean;
+            var eventWeight = trainingMode ? 4 : 1;
+
+            if (pendingAcceptance is not null && !acceptedSuggestion && !acceptedThenExtended)
+            {
+                if (LooksLikeWord(suggestedWord))
+                {
+                    _eventStore.RecordCorrection(suggestedWord, actual, normalizedContext, eventWeight);
+                    lock (_gate)
+                    {
+                        GetOrCreateSignalsLocked(suggestedWord).CorrectedAwayCount += eventWeight;
+                        GetOrCreateSignalsLocked(actual).CorrectionTargetCount += eventWeight;
+                    }
+                }
+            }
+
+            _eventStore.RecordEvent(
+                eventType,
+                actual,
+                normalizedContext,
+                prefix: pendingAcceptance?.Prefix ?? string.Empty,
+                suggestion: pendingAcceptance?.SuggestedWord ?? string.Empty,
+                weight: eventWeight);
+
+            lock (_gate)
+            {
+                var signals = GetOrCreateSignalsLocked(actual);
+                if (eventType == LearningEventType.TrainingObservation)
+                {
+                    signals.TrainingObservationCount += eventWeight;
+                }
+                else if (eventType == LearningEventType.AcceptedSuggestion)
+                {
+                    signals.AcceptedSuggestionCount += eventWeight;
+                }
+                else
+                {
+                    signals.ConfirmedCount += eventWeight;
+                }
+            }
+        }
+
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public LearningWordSignals GetWordSignals(string word)
+    {
+        var normalized = NormalizeWord(word);
+        lock (_gate)
+        {
+            return _wordSignals.TryGetValue(normalized, out var signals)
+                ? CloneSignals(signals)
+                : new LearningWordSignals();
+        }
+    }
+
+    public bool IsBlocked(string word)
+    {
+        var normalized = NormalizeWord(word);
+        lock (_gate)
+        {
+            return _wordSignals.TryGetValue(normalized, out var signals) && signals.Blocked;
+        }
+    }
+
+    public IReadOnlyList<LearningWordView> GetLearningWordsSnapshot()
+    {
+        lock (_gate)
+        {
+            return _data.Words.Keys
+                .Concat(_wordSignals.Keys)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(word =>
+                {
+                    var stat = _data.Words.TryGetValue(word, out var value) ? value : new WordStat { LastUsedUtc = DateTime.MinValue };
+                    var signals = _wordSignals.TryGetValue(word, out var signalValue) ? signalValue : new LearningWordSignals();
+                    return new LearningWordView(
+                        word,
+                        stat.TypedCount,
+                        stat.AcceptedCount,
+                        stat.TrainingCount,
+                        stat.CorpusCount,
+                        stat.CorrectedCount,
+                        signals.ConfirmedCount,
+                        signals.RejectedSuggestionCount,
+                        signals.CorrectedAwayCount,
+                        signals.CorrectionTargetCount,
+                        signals.DeletedCount,
+                        signals.Trusted,
+                        signals.Blocked,
+                        _seedRanks.ContainsKey(word),
+                        stat.LastUsedUtc);
+                })
+                .OrderByDescending(x => x.LikelyError)
+                .ThenByDescending(x => x.NeedsReview)
+                .ThenByDescending(x => x.NegativeSignals)
+                .ThenByDescending(x => x.PositiveSignals)
+                .ThenBy(x => x.Word, StringComparer.CurrentCultureIgnoreCase)
+                .ToArray();
+        }
+    }
+
+    public IReadOnlyList<LearningCorrectionView> GetCorrectionsSnapshot() => _eventStore.GetCorrections();
+
+    public void SetWordBlocked(string word, bool blocked)
+    {
+        var normalized = NormalizeWord(word);
+        if (!LooksLikeWord(normalized))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            GetOrCreateSignalsLocked(normalized).Blocked = blocked;
+        }
+        _eventStore.SetWordFlags(normalized, blocked: blocked);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void SetWordTrusted(string word, bool trusted)
+    {
+        var normalized = NormalizeWord(word);
+        if (!LooksLikeWord(normalized))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            GetOrCreateSignalsLocked(normalized).Trusted = trusted;
+        }
+        _eventStore.SetWordFlags(normalized, trusted: trusted);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void DeleteLearnedWord(string word) => DeleteLearnedWords(new[] { word });
+
+    public int DeleteLearnedWords(IEnumerable<string> words)
+    {
+        var normalizedWords = words
+            .Select(NormalizeWord)
+            .Where(word => word.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (normalizedWords.Length == 0)
+        {
+            return 0;
+        }
+
+        lock (_gate)
+        {
+            foreach (var word in normalizedWords)
+            {
+                RemoveWordLocked(word);
+                _wordSignals.Remove(word);
+            }
+            MarkDirtyLocked();
+        }
+
+        _eventStore.DeleteWords(normalizedWords);
+        SaveNow();
+        Changed?.Invoke(this, EventArgs.Empty);
+        return normalizedWords.Length;
+    }
+
+    public int PurgeLikelyErrors()
+    {
+        var candidates = GetLearningWordsSnapshot()
+            .Where(x => x.LikelyError)
+            .Select(x => x.Word)
+            .ToArray();
+        return DeleteLearnedWords(candidates);
+    }
+
+    public void RecordCorrection(
+        string originalWord,
+        string correctedWord,
+        IReadOnlyList<string> contextWords,
+        bool trainingMode)
+    {
+        var original = NormalizeWord(originalWord);
+        var corrected = NormalizeWord(correctedWord);
+        if (!LooksLikeWord(original) || !LooksLikeWord(corrected) ||
+            string.Equals(original, corrected, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var weight = trainingMode ? 4 : 1;
+        lock (_gate)
+        {
+            if (_data.Words.TryGetValue(original, out var originalStat))
+            {
+                originalStat.CorrectedCount += weight;
+            }
+            var originalSignals = GetOrCreateSignalsLocked(original);
+            originalSignals.CorrectedAwayCount += weight;
+            var correctedSignals = GetOrCreateSignalsLocked(corrected);
+            correctedSignals.CorrectionTargetCount += weight;
+            MarkDirtyLocked();
+        }
+        _eventStore.RecordCorrection(original, corrected, contextWords, weight);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void RecordDeletedWord(string word, IReadOnlyList<string> contextWords)
+    {
+        var normalized = NormalizeWord(word);
+        if (!LooksLikeWord(normalized))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            GetOrCreateSignalsLocked(normalized).DeletedCount++;
+        }
+        _eventStore.RecordEvent(LearningEventType.DeletedToken, normalized, contextWords);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void RecordDismissedPopup(string prefix, IReadOnlyList<string> contextWords)
+    {
+        _eventStore.RecordEvent(LearningEventType.DismissedPopup, NormalizeWord(prefix), contextWords, prefix: prefix);
     }
 
     public (int Words, int Tokens) ImportCorpus(IEnumerable<string> filePaths)
@@ -740,9 +1013,13 @@ public sealed class LocalLearningStore : IDisposable
         lock (_gate)
         {
             _data = new ProfileData();
+            _wordSignals = new Dictionary<string, LearningWordSignals>(StringComparer.OrdinalIgnoreCase);
             _dirty = true;
         }
 
+        _eventStore.ClearProfile();
+        var modelPath = AppSettings.GetMlModelPath(ProfileName);
+        try { if (File.Exists(modelPath)) File.Delete(modelPath); } catch { }
         SaveNow();
         Changed?.Invoke(this, EventArgs.Empty);
     }
@@ -751,6 +1028,7 @@ public sealed class LocalLearningStore : IDisposable
     {
         Directory.CreateDirectory(AppSettings.ProfilesRoot);
         return Directory.EnumerateFiles(AppSettings.ProfilesRoot, "*.json")
+            .Where(path => !path.EndsWith(".ml.json", StringComparison.OrdinalIgnoreCase))
             .Select(Path.GetFileNameWithoutExtension)
             .Where(x => !string.IsNullOrWhiteSpace(x))
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -1182,6 +1460,93 @@ public sealed class LocalLearningStore : IDisposable
             : amount;
     }
 
+    private void RefreshSignalsFromEvents()
+    {
+        var loaded = _eventStore.GetWordSignals();
+        lock (_gate)
+        {
+            _wordSignals = loaded.ToDictionary(
+                pair => pair.Key,
+                pair => CloneSignals(pair.Value),
+                StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
+    private LearningWordSignals GetOrCreateSignalsLocked(string word)
+    {
+        if (!_wordSignals.TryGetValue(word, out var signals))
+        {
+            signals = new LearningWordSignals();
+            _wordSignals[word] = signals;
+        }
+        return signals;
+    }
+
+    private static LearningWordSignals CloneSignals(LearningWordSignals value) => new()
+    {
+        ConfirmedCount = value.ConfirmedCount,
+        TrainingObservationCount = value.TrainingObservationCount,
+        AcceptedSuggestionCount = value.AcceptedSuggestionCount,
+        RejectedSuggestionCount = value.RejectedSuggestionCount,
+        CorrectedAwayCount = value.CorrectedAwayCount,
+        CorrectionTargetCount = value.CorrectionTargetCount,
+        DeletedCount = value.DeletedCount,
+        Trusted = value.Trusted,
+        Blocked = value.Blocked
+    };
+
+    private void RemoveWordLocked(string word)
+    {
+        _data.Words.Remove(word);
+        RemoveKeysContainingTokenLocked(_data.Bigrams, word);
+        RemoveKeysContainingTokenLocked(_data.Trigrams, word);
+        RemoveKeysContainingTokenLocked(_data.Fourgrams, word);
+        RemoveKeysContainingTokenLocked(_data.Fivegrams, word);
+
+        foreach (var key in _data.PrefixChoices.Keys
+                     .Where(key => KeyContainsToken(key, word))
+                     .ToArray())
+        {
+            _data.PrefixChoices.Remove(key);
+        }
+
+        foreach (var pair in _data.ContextPrefixChoices.ToArray())
+        {
+            if (KeyContainsToken(pair.Key, word))
+            {
+                _data.ContextPrefixChoices.Remove(pair.Key);
+                continue;
+            }
+
+            pair.Value.Remove(word);
+            if (pair.Value.Count == 0)
+            {
+                _data.ContextPrefixChoices.Remove(pair.Key);
+            }
+        }
+
+        foreach (var key in _data.RejectedChoices.Keys
+                     .Where(key => KeyContainsToken(key, word))
+                     .ToArray())
+        {
+            _data.RejectedChoices.Remove(key);
+        }
+    }
+
+    private static bool KeyContainsToken(string key, string word) =>
+        key.Split(new[] { '\u001F', '\u001E' }, StringSplitOptions.RemoveEmptyEntries)
+            .Any(token => string.Equals(token, word, StringComparison.OrdinalIgnoreCase));
+
+    private static void RemoveKeysContainingTokenLocked(IDictionary<string, int> source, string word)
+    {
+        foreach (var key in source.Keys
+                     .Where(key => key.Split('\u001F').Any(token => string.Equals(token, word, StringComparison.OrdinalIgnoreCase)))
+                     .ToArray())
+        {
+            source.Remove(key);
+        }
+    }
+
     private void MarkDirtyLocked()
     {
         _dirty = true;
@@ -1332,6 +1697,7 @@ public sealed class LocalLearningStore : IDisposable
     {
         SaveNow();
         _saveTimer.Dispose();
+        _eventStore.Dispose();
         GC.SuppressFinalize(this);
     }
 }

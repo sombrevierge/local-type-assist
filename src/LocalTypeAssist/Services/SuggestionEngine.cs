@@ -7,12 +7,18 @@ public sealed class SuggestionEngine
     private readonly LocalLearningStore _store;
     private readonly MorphologyService _morphology;
     private readonly AppSettings _settings;
+    private readonly PersonalMlScorer _mlScorer;
 
-    public SuggestionEngine(LocalLearningStore store, MorphologyService morphology, AppSettings settings)
+    public SuggestionEngine(
+        LocalLearningStore store,
+        MorphologyService morphology,
+        AppSettings settings,
+        PersonalMlScorer mlScorer)
     {
         _store = store;
         _morphology = morphology;
         _settings = settings;
+        _mlScorer = mlScorer;
     }
 
     public IReadOnlyList<SuggestionItem> Suggest(string rawPrefix, IReadOnlyList<string> contextWords, int limit)
@@ -93,12 +99,17 @@ public sealed class SuggestionEngine
         var lemmaFourthPrevious = lemmaContext.Length >= 4 ? lemmaContext[^4] : string.Empty;
         var now = DateTime.UtcNow;
         var nextWordMode = normalizedPrefix.Length == 0;
+        var mlStatus = _settings.PersonalMlEnabled ? _mlScorer.GetStatus() : null;
+        var mlScale = mlStatus is { Available: true }
+            ? 4.0 + Math.Min(1.0, mlStatus.SampleCount / 500.0) * 5.0
+            : 0.0;
 
         var scored = new List<SuggestionItem>(candidateMap.Count);
         foreach (var candidate in candidateMap.Values)
         {
             var word = LocalLearningStore.NormalizeWord(candidate.Text);
             if (word.Length == 0 ||
+                _store.IsBlocked(word) ||
                 normalizedPrefix.Length > 0 &&
                 (word.Length <= normalizedPrefix.Length ||
                  !word.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase)))
@@ -107,6 +118,7 @@ public sealed class SuggestionEngine
             }
 
             var stat = _store.GetWordStat(word);
+            var signals = _store.GetWordSignals(word);
             var seedRank = Math.Min(_store.GetSeedRank(word), _store.GetSeedRank(candidate.Lemma));
             var seedScore = seedRank == int.MaxValue
                 ? 0
@@ -238,10 +250,22 @@ public sealed class SuggestionEngine
 
             var shortWordBonus = word.Length <= 3 && seedRank <= 90 ? 1.5 : 0;
             var contextPresenceBonus = nextWordMode && contextScore > 0 ? 2.5 : 0;
+            var confirmedBonus = Math.Log(1 + signals.ConfirmedCount) * 4.8;
+            var correctionTargetBonus = Math.Log(1 + signals.CorrectionTargetCount) * 9.5;
+            var trustedBonus = signals.Trusted ? 18.0 : 0.0;
+            var correctedAwayPenalty = Math.Log(1 + signals.CorrectedAwayCount) * 12.5;
+            var deletionPenalty = Math.Log(1 + signals.DeletedCount) * 4.0;
+            var mlScore = _settings.PersonalMlEnabled
+                ? _mlScorer.Score(normalizedPrefix, context, word)
+                : 0.0;
+            // ML starts as a supporting signal and becomes one of the strongest personal
+            // ranking factors as the profile accumulates labelled examples.
+            var mlContribution = mlScore * mlScale;
             var score = seedScore + typedScore + trainingScore + corpusScore + acceptedScore +
                         contextScore + prefixChoiceScore + recencyScore + morphologyScore +
-                        shortWordBonus + contextPresenceBonus -
-                        correctedPenalty - rejectedChoicePenalty - lengthPenalty;
+                        shortWordBonus + contextPresenceBonus + confirmedBonus + correctionTargetBonus +
+                        trustedBonus + mlContribution -
+                        correctedPenalty - rejectedChoicePenalty - correctedAwayPenalty - deletionPenalty - lengthPenalty;
 
             scored.Add(new SuggestionItem(
                 ApplyCase(word, rawPrefix),
@@ -257,7 +281,8 @@ public sealed class SuggestionEngine
                 prefixChoiceCount,
                 Math.Abs(morphologyScore) > 0.2,
                 false,
-                0));
+                0,
+                mlScore));
         }
 
         return scored
