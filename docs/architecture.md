@@ -1,42 +1,57 @@
-# Architecture — Local Type Assist v6
+# Architecture — Local Type Assist v7
 
 ## Input path
 
-`KeyboardHook` installs `WH_KEYBOARD_LL`. Non-injected key-down events are translated with the active keyboard layout and passed to `TypingController`. Injected events are ignored, preventing a feedback loop.
+`KeyboardHook` installs `WH_KEYBOARD_LL`. Non-injected key events are translated with the active keyboard layout and passed to `TypingController`. Injected events are ignored so text inserted by the application does not re-enter the learning loop.
 
-`TypingController` keeps the current word, up to three completed context words, current suggestions and temporary selected completion. A timer schedules idle completion. Every schedule stores the current revision, word, foreground window and focus token so a stale timer cannot complete a newer word.
+`TypingController` tracks the current token, up to five context words, suggestions, temporary completions and edit history. Idle completion is revision-gated by the current word, foreground window and focus token.
 
-## Cross-application completion
+## Delayed confirmation and corrections
 
-`InputInjector` uses Unicode `SendInput`. Immediate completion types only the suffix and selects it with `Shift+Left`. This makes ordinary typing replace the temporary suffix naturally in browsers and desktop editors. Space/punctuation moves the caret to the end and commits the word. Shift deletes the selected suffix and suppresses suggestions for the rest of that word.
+A completed word is kept as a provisional token for one word instead of being positively learned immediately. If the user presses Backspace across the delimiter, the provisional token returns to editing state. The original and final forms can then be recorded as a correction pair.
 
-## Focus and privacy
+Backspace inside a word also starts an edit trace. If the final token differs from the form seen before editing, the old form gets a negative correction signal and the new form becomes the correction target. If the token is erased entirely, a deletion event is recorded. This prevents immediate typos from becoming strong positive examples.
 
-`PrivacyGuard` ignores the app itself, password fields and known credential/password-manager processes. The focus token avoids volatile UIA `RuntimeId` and text-derived `Name`, using the foreground window plus stable control metadata and approximate field location. This prevents Chromium contenteditable controls from resetting the prefix after each character while still distinguishing different fields in the browser.
+## Suggestion dismissal
+
+`Esc` or the `×` control in `SuggestionWindow` hides the popup for the rest of the current token. Dismissal is stored as a neutral UI event; it is deliberately separate from rejecting a particular suggestion. A new token clears the suppression state.
 
 ## Ranking
 
 `SuggestionEngine` combines:
 
 - seed word rank;
-- typed, accepted and corrected counts;
-- learned prefix → word choices;
-- personal bigram/trigram counts;
-- embedded starter phrase counts;
+- typed, accepted, training and corpus counts;
+- personal prefix choices and context-prefix choices;
+- personal n-grams up to five words and lemma backoff;
 - recency;
-- completion length;
-- morphology and grammatical agreement.
+- morphology and grammatical agreement;
+- confirmed clean observations and correction targets;
+- correction/deletion/rejection penalties;
+- explicit trusted/blocked word flags;
+- optional personal ML reranker score.
 
-The context model is local n-gram ranking, not a generative LLM. Personal counts have larger multipliers than the embedded starter phrases.
+Blocked words are excluded. Trusted words receive an explicit positive prior. Personal ML has a strong but bounded contribution so it cannot bypass prefix safety or rewrite typed text.
 
-## Morphology
+## Personal ML
 
-`MorphologyService` initializes `NestorMorph` directly and asynchronously. It builds a prefix index for generated word forms and caches analyses. Candidate agreement checks person, number, gender, case, tense and infinitive expectations. Enum value `None` is treated as absent rather than as a conflicting grammatical value.
+The optional trainer is `Resources/ml/train_personal_model.py`. It reads only the local SQLite event database and uses scikit-learn `DictVectorizer` plus `SGDClassifier(loss="log_loss")`. Positive examples come from clean typing, training mode, accepted suggestions and correction targets. Negative examples come from rejected suggestions and corrected-away forms.
+
+The trainer exports a compact JSON file containing an intercept and feature weights. C# loads that file through `PersonalMlScorer`; Python is not used during ordinary typing. Features include candidate identity, prefix, prefix/candidate pair, suffix-length bucket and up to four context n-grams.
 
 ## Storage
 
-Each profile is a JSON file under `%LOCALAPPDATA%\LocalTypeAssist\profiles`. It stores words, bigrams, trigrams, prefix choices and learned gender signals. Writes are debounced and performed atomically through a temporary file.
+Two local layers are used under `%LOCALAPPDATA%\LocalTypeAssist`:
 
-## UI
+1. existing profile JSON files keep aggregate counts and n-grams for backward compatibility with v6 data;
+2. `learning-v7.sqlite3` stores event-level learning signals, correction pairs and trust/block flags.
 
-WPF is used only for the settings window and non-activating suggestion overlay. The release is self-contained `win-x64`, multi-file, and untrimmed for compatibility with the morphology package.
+The ML model is stored beside the profile as `<profile>.ml.json`. All of these files are outside the repository and are ignored by Git.
+
+## Learning library
+
+`LearningLibraryWindow` exposes accumulated personal words and v7 corrections. Users can search, delete individual learned words, mark words trusted, block words, and remove cautiously detected likely errors. Deleting a learned word removes its aggregate counts, matching personal n-grams/context choices and associated v7 events.
+
+## Privacy
+
+`PrivacyGuard` excludes password fields and known credential/password-manager contexts. No learning event, imported corpus or ML model is uploaded by the application.
